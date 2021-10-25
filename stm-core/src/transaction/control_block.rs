@@ -6,8 +6,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::thread::{self, Thread};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, Thread};
+use std::time::Duration;
 
 #[cfg(test)]
 use super::super::test::{terminates, terminates_async};
@@ -17,15 +18,18 @@ use super::super::test::{terminates, terminates_async};
 /// STM blocks on all read variables if retry was called.
 /// This control block is used to let the vars inform the STM instance.
 ///
-/// Be careful when using this directly, 
+/// Be careful when using this directly,
 /// because you can easily create deadlocks.
 pub struct ControlBlock {
     /// This is the handle to the thread, that waits on the control block.
     thread: Thread,
 
-    /// Atomic bool stores if the thread has been blocked yet. 
+    /// Atomic bool stores if the thread has been blocked yet.
     /// Make sure, that park is repeated if no change has happened.
     blocked: AtomicBool,
+
+    // Safety check to avoid deadlocks.
+    park_timeout: Duration,
 }
 
 impl ControlBlock {
@@ -36,6 +40,7 @@ impl ControlBlock {
         ControlBlock {
             thread: thread::current(),
             blocked: AtomicBool::new(true),
+            park_timeout: Duration::from_millis(1000),
         }
     }
 
@@ -57,11 +62,24 @@ impl ControlBlock {
     /// `wait` needs to be called by the STM instance itself.
     pub fn wait(&self) {
         while self.blocked.load(Ordering::SeqCst) {
-            thread::park();
+            // Deadlocks can happen when `set_change` runs here,
+            // or we call `wait` on a thread which is different
+            // from `self.thread`.
+
+            // assert_eq!(thread::current().id(), self.thread.id());
+            // thread::park();
+
+            // To deal with both, make sure the thread is not parked forever.
+            thread::park_timeout(self.park_timeout);
         }
     }
-}
 
+    /// Here to make tests faster while allowing a long timeout in the normal case.
+    #[allow(dead_code)]
+    fn set_park_timeout(&mut self, park_timeout: Duration) {
+        self.park_timeout = park_timeout;
+    }
+}
 
 // TESTS
 #[cfg(test)]
@@ -104,17 +122,31 @@ mod test {
         assert!(terminates(50, move || ctrl.wait()));
     }
 
-
     /// Perform a wakeup from another thread.
     #[test]
     fn wait_threaded_wakeup() {
         use std::sync::Arc;
 
-        let ctrl = Arc::new(ControlBlock::new());
+        let ctrl = Arc::new({
+            let mut ctrl = ControlBlock::new();
+            ctrl.set_park_timeout(Duration::from_millis(250));
+            ctrl
+        });
         let ctrl2 = ctrl.clone();
-        let terminated = terminates_async(500,
-                                    move || ctrl.wait(),
-                                    move || ctrl2.set_changed());
+        // NOTE: This is slightly broken: `terminates_async` will run
+        // `f` on a spawned thread and `g` on the main thread, which means
+        // the thread that parks itself in `wait` will be different from the
+        // one that `set_changes` wakes up, which is the main thread itself.
+        // That means `f` will never be unparked, unless it uses a timeout;
+        // `wait` should only really be called on the thread that did `new`.
+        let terminated = terminates_async(
+            500,
+            move || ctrl.wait(),
+            move || {
+                thread::sleep(Duration::from_millis(100));
+                ctrl2.set_changed();
+            },
+        );
 
         assert!(terminated);
     }
