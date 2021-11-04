@@ -115,11 +115,15 @@
 //! keep the amount of accessed variables as low as needed.
 //!
 
+#![feature(test)]
+
 extern crate parking_lot;
+extern crate test as etest;
 
 mod transaction;
 mod tvar;
 mod result;
+mod queues;
 
 #[cfg(test)]
 mod test;
